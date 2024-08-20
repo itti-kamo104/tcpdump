@@ -1,4 +1,7 @@
 *.orig
+build
+.cache
+compile_commands.json
 *.rej
 /Makefile
 *~
