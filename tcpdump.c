@@ -1335,12 +1335,20 @@ static pcap_t *open_interface(const char *device, netdissect_options *ndo,
   return (pc);
 }
 
+pcap_handler orig_callback;
+void byte_analyze(u_char *name, const struct pcap_pkthdr *phdr,
+                  const u_char *pd) {
+  printf("Hello from custom callback\n");
+
+  orig_callback(name, phdr, pd);
+}
+
 int main(int argc, char **argv) {
   int cnt, op, i;
   bpf_u_int32 localnet = 0, netmask = 0;
   char *cp, *infile, *cmdbuf, *device, *RFileName, *VFileName, *WFileName;
   char *endp;
-  pcap_handler callback;
+  pcap_handler callback = byte_analyze;
   int dlt;
   const char *dlt_name;
   struct bpf_program fcode;
@@ -2323,12 +2331,14 @@ int main(int argc, char **argv) {
 #else /* !HAVE_CAPSICUM */
       dumpinfo.WFileName = WFileName;
 #endif
-      callback = dump_packet_and_trunc;
+      orig_callback = dump_packet_and_trunc;
+      // callback = dump_packet_and_trunc;
       dumpinfo.pd = pd;
       dumpinfo.pdd = pdd;
       pcap_userdata = (u_char *)&dumpinfo;
     } else {
-      callback = dump_packet;
+      orig_callback = dump_packet;
+      // callback = dump_packet;
       dumpinfo.WFileName = WFileName;
       dumpinfo.pd = pd;
       dumpinfo.pdd = pdd;
@@ -2346,7 +2356,8 @@ int main(int argc, char **argv) {
   } else {
     dlt = pcap_datalink(pd);
     ndo->ndo_if_printer = get_if_printer(dlt);
-    callback = print_packet;
+    orig_callback = print_packet;
+    // callback = print_packet;
     pcap_userdata = (u_char *)ndo;
   }
 
