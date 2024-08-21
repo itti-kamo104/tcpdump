@@ -19,6 +19,8 @@
  * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE.
  */
 
+ #include <netdissect.h>
+
 /*
  * Maximum length of the length field in an Ethernet header; any value
  * greater than this is not a length value, so it's either an Ethernet

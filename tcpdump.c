@@ -38,7 +38,6 @@
 #include <endian.h>
 
 #include <ethertype.h>
-#include <netdissect.h>
 
 #include "netdissect-stdinc.h"
 
