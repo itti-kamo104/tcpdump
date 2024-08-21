@@ -1349,7 +1349,7 @@ static pcap_t *open_interface(const char *device, netdissect_options *ndo,
 // #include <sys/types.h>
 #include <sys/un.h>
 
-char *socket_address = "/tmp/talker.sock";
+char *ipc_socket_address = "/tmp/talker.sock";
 int ipc_socket_fd;
 
 void socket_connect() {
@@ -1364,12 +1364,12 @@ void socket_connect() {
 
   /* Construct the client address structure. */
   sockaddr_un.sun_family = AF_UNIX;
-  strcpy(sockaddr_un.sun_path, socket_address);
+  strcpy(sockaddr_un.sun_path, ipc_socket_address);
 
   return_value = connect(ipc_socket_fd, (struct sockaddr *)&sockaddr_un,
                          sizeof(struct sockaddr_un));
 
-  /* If socket_address doesn't exist on the filesystem,   */
+  /* If ipc_socket_address doesn't exist on the filesystem,   */
   /* or if the server's connection-request queue is full, */
   /* then connect() will fail.                            */
   if (return_value == -1) {
@@ -1385,21 +1385,33 @@ void socket_connect() {
 /*
  * Structure of an Ethernet header.
  */
+#pragma pack(push, 1)
 struct ether_header {
   nd_mac48 ether_dhost;
   nd_mac48 ether_shost;
   nd_uint16_t ether_length_type;
 };
-pcap_handler orig_callback;
-uint8_t addr_num;
-int addresses[256];
-uint8_t bytes[256];
-#pragma pack(push, 1)
+struct ip_header {
+  nd_uint8_t ip_vhl;      /* header length, version */
+  nd_uint8_t ip_tos;      /* type of service */
+  nd_uint16_t ip_len;     /* total length */
+  nd_uint16_t ip_id;      /* identification */
+  nd_uint16_t ip_off;     /* fragment offset field */
+  nd_uint8_t ip_ttl;      /* time to live */
+  nd_uint8_t ip_p;        /* protocol */
+  nd_uint16_t ip_sum;     /* checksum */
+  nd_ipv4 ip_src, ip_dst; /* source and dest address */
+};
 typedef struct {
   struct timeval ts;
   uint8_t flow_id;
 } ipc_message;
 #pragma pack(pop)
+
+pcap_handler orig_callback;
+uint8_t addr_num;
+int addresses[256];
+uint8_t bytes[256];
 
 // returns -1 if not, or positive integer with offset of start of packet
 int is_ip(const uint8_t *pd, uint32_t len) {
@@ -1410,17 +1422,13 @@ int is_ip(const uint8_t *pd, uint32_t len) {
 
   struct ether_header *ehdr = (struct ether_header *)pd;
   uint16_t eth_type = be16toh(*(uint16_t *)ehdr->ether_length_type);
-  // printf("\n\n\n");
-  // for (int i = 0; i < len; i++) {
-  //   printf("0x%02X:", pd[i]);
-  // }
-  // printf("\n\n\n");
 
   struct ip *iphdr;
+  // printf("ether_type: 0x%04x\n", eth_type);
   switch (eth_type) {
   case ETHERTYPE_8021QinQ:
   case ETHERTYPE_8021Q:
-    uint8_t add = eth_type == ETHERTYPE_8021QinQ ? 4 : 0;
+    int add = eth_type == ETHERTYPE_8021QinQ ? 4 : 0;
     if (len < offset + 4 + add)
       return -1;
     uint16_t eth_type = be16toh(*(uint16_t *)(pd + offset + 2 + add));
@@ -1430,37 +1438,42 @@ int is_ip(const uint8_t *pd, uint32_t len) {
   case ETHERTYPE_IP:
     return offset;
   default:
-    // printf("PACKET REG\n\n\n\n");
     return -1;
   }
   return offset;
 }
 int is_udp(const uint8_t *pd, uint32_t len) {
   int offset = is_ip(pd, len);
-  if (!offset)
+  if (offset == -1)
     return -1;
   int ip_size = sizeof(struct ip) + offset;
   if (len < ip_size)
     return -1;
 
-  struct ip *iphdr = (struct ip *)pd + offset;
+  struct ip *iphdr = (struct ip *)(pd + offset);
   uint8_t ip_p = iphdr->ip_p[0];
+  printf("ip proto: %02x\n", ip_p);
   if (ip_p != IPPROTO_UDP)
     return -1;
-  uint8_t hlen = (iphdr->ip_vhl[0] & 0b00001111) * 4;
-  return hlen;
+  int hlen = (iphdr->ip_vhl[0] & 0b00001111) * 4;
+  return offset + hlen;
 }
 
 void byte_analyze(u_char *name, const struct pcap_pkthdr *phdr,
                   const u_char *pd) {
   int offset = is_udp(pd, phdr->len);
-  if (!offset)
+  if (offset == -1)
     goto exit;
   // add udp header size
   offset += 8;
 
+  printf("payload dump:\n");
+  for (int i = 0; i < phdr->len - offset; i++) {
+    printf("0x%02x:", pd[offset + i]);
+  }
+  printf("\n");
+
   for (int i = 0; i < addr_num; i++) {
-    // printf("%d,%c\n", addresses[i], bytes[i]);
     int check_addr = addresses[i];
     uint8_t expected = bytes[i];
 
@@ -1472,6 +1485,10 @@ void byte_analyze(u_char *name, const struct pcap_pkthdr *phdr,
     tmp.flow_id = *(uint8_t *)(pd + offset + check_addr);
     if (tmp.flow_id != expected)
       continue;
+    write(ipc_socket_fd, &tmp, sizeof(tmp));
+    printf("found matching byte:0x%02x at position:%d\n", tmp.flow_id,
+           check_addr);
+    printf("sending to ipc_socket:%s", ipc_socket_address);
     write(ipc_socket_fd, &tmp, sizeof(tmp));
   }
 
@@ -2589,7 +2606,7 @@ int main(int argc, char **argv) {
     Start IPC communication
   */
   if (addr_num > 0) {
-    // socket_connect();
+    socket_connect();
     orig_callback = callback;
     callback = byte_analyze;
   }
