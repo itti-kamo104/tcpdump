@@ -35,9 +35,11 @@
 
 #include <bits/types/struct_timeval.h>
 #include <config.h>
+#include <ctype.h>
 #include <endian.h>
 
 #include <ethertype.h>
+#include <sys/socket.h>
 
 #include "netdissect-stdinc.h"
 
@@ -1350,14 +1352,14 @@ static pcap_t *open_interface(const char *device, netdissect_options *ndo,
 #include <sys/un.h>
 
 char *ipc_socket_address = "/tmp/talker.sock";
-int ipc_socket_fd;
+// int ipc_socket_fd;
 
-void socket_connect() {
+int socket_connect(int fd) {
   struct sockaddr_un sockaddr_un = {0};
   int return_value;
 
-  ipc_socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-  if (ipc_socket_fd == -1) {
+  fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd == -1) {
     perror("unable to initialize client ipc socket");
     exit(1);
   }
@@ -1366,8 +1368,8 @@ void socket_connect() {
   sockaddr_un.sun_family = AF_UNIX;
   strcpy(sockaddr_un.sun_path, ipc_socket_address);
 
-  return_value = connect(ipc_socket_fd, (struct sockaddr *)&sockaddr_un,
-                         sizeof(struct sockaddr_un));
+  return_value =
+      connect(fd, (struct sockaddr *)&sockaddr_un, sizeof(struct sockaddr_un));
 
   /* If ipc_socket_address doesn't exist on the filesystem,   */
   /* or if the server's connection-request queue is full, */
@@ -1378,7 +1380,8 @@ void socket_connect() {
   }
 
   /* close( client_socket_fd ); <-- optional */
-
+  printf("successfully connected to ipc socket\n");
+  return fd;
   // exit(EXIT_SUCCESS);
 }
 
@@ -1411,7 +1414,8 @@ typedef struct {
 pcap_handler orig_callback;
 uint8_t addr_num;
 int addresses[256];
-uint8_t bytes[256];
+int bytes[256];
+int pipes_fd[256];
 
 // returns -1 if not, or positive integer with offset of start of packet
 int is_ip(const uint8_t *pd, uint32_t len) {
@@ -1467,15 +1471,16 @@ void byte_analyze(u_char *name, const struct pcap_pkthdr *phdr,
   // add udp header size
   offset += 8;
 
-  printf("payload dump:\n");
-  for (int i = 0; i < phdr->len - offset; i++) {
-    printf("0x%02x:", pd[offset + i]);
-  }
-  printf("\n");
+  // printf("payload dump:\n");
+  // for (int i = 0; i < phdr->len - offset; i++) {
+  //   printf("0x%02x:", pd[offset + i]);
+  // }
+  // printf("\n");
 
   for (int i = 0; i < addr_num; i++) {
     int check_addr = addresses[i];
-    uint8_t expected = bytes[i];
+    int expected = bytes[i];
+    printf("checking for number: 0x%x at position: %d\n", expected, check_addr);
 
     if (offset + check_addr > phdr->len)
       continue;
@@ -1485,11 +1490,16 @@ void byte_analyze(u_char *name, const struct pcap_pkthdr *phdr,
     tmp.flow_id = *(uint8_t *)(pd + offset + check_addr);
     if (tmp.flow_id != expected)
       continue;
-    write(ipc_socket_fd, &tmp, sizeof(tmp));
-    printf("found matching byte:0x%02x at position:%d\n", tmp.flow_id,
-           check_addr);
-    printf("sending to ipc_socket:%s", ipc_socket_address);
-    write(ipc_socket_fd, &tmp, sizeof(tmp));
+    // printf("found matching byte:0x%02x at position:%d\n", tmp.flow_id,
+    //        check_addr);
+    int ret = write(ipc_socket_fd, &tmp, sizeof(tmp));
+    // int ret = send(ipc_socket_fd, &tmp, sizeof(tmp), MSG_NOSIGNAL);
+    if (ret > 0) {
+      printf("success sending to ipc socket:%s\n", ipc_socket_address);
+      continue;
+    }
+    // close(ipc_socket_fd);
+    // socket_connect();
   }
 
 exit:
@@ -1571,11 +1581,25 @@ int main(int argc, char **argv) {
    * but in some cases (sandboxing, chroot) this may be too late.
    */
   tzset();
-
   while ((op = getopt_long(argc, argv, SHORTOPTS, longopts, NULL)) != -1)
     switch (op) {
     case OPTION_IPC_NOTIFY:
-      sscanf(optarg, "%d,%c", &addresses[addr_num], &bytes[addr_num]);
+      char str[1024];
+      sscanf(optarg, "%d,%1023s", &addresses[addr_num], str);
+      if (str[0] == '0' && str[1] == 'x') {
+        // read as a hex
+        int byte;
+        sscanf(str, "0x%x", &byte);
+        bytes[addr_num] = byte;
+      } else if (('z' >= str[0] && str[0] >= 'a') ||
+                 ('Z' >= str[0] && str[0] >= 'A')) {
+        // read as char
+        bytes[addr_num] = str[0];
+      } else {
+
+        // read as an integer
+        bytes[addr_num] = atoi(str);
+      }
       addr_num++;
       break;
 
