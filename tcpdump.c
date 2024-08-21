@@ -33,7 +33,12 @@
  * combined efforts of Van, Steve McCanne and Craig Leres of LBL.
  */
 
+#include <bits/types/struct_timeval.h>
 #include <config.h>
+#include <endian.h>
+
+#include <ethertype.h>
+#include <netdissect.h>
 
 #include "netdissect-stdinc.h"
 
@@ -625,10 +630,12 @@ static void NORETURN show_remote_devices_and_exit(void) {
 #define OPTION_COUNT 136
 #define OPTION_PRINT_SAMPLING 137
 #define OPTION_LENGTHS 138
+#define OPTION_IPC_NOTIFY 139
 
 static const struct option longopts[] = {
     {"buffer-size", required_argument, NULL, 'B'},
     {"list-interfaces", no_argument, NULL, 'D'},
+    {"ipc-notify", required_argument, NULL, OPTION_IPC_NOTIFY},
 #ifdef HAVE_PCAP_FINDALLDEVS_EX
     {"list-remote-interfaces", required_argument, NULL,
      OPTION_LIST_REMOTE_INTERFACES},
@@ -1334,12 +1341,142 @@ static pcap_t *open_interface(const char *device, netdissect_options *ndo,
 
   return (pc);
 }
+// #include <stdlib.h>
+// #include <string.h>
+// #include <stdio.h>
+// #include <unistd.h>
+// #include <assert.h>
+// #include <sys/socket.h>
+// #include <sys/types.h>
+#include <sys/un.h>
 
+char *socket_address = "/tmp/talker.sock";
+int ipc_socket_fd;
+
+void socket_connect() {
+  struct sockaddr_un sockaddr_un = {0};
+  int return_value;
+
+  ipc_socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (ipc_socket_fd == -1) {
+    perror("unable to initialize client ipc socket");
+    exit(1);
+  }
+
+  /* Construct the client address structure. */
+  sockaddr_un.sun_family = AF_UNIX;
+  strcpy(sockaddr_un.sun_path, socket_address);
+
+  return_value = connect(ipc_socket_fd, (struct sockaddr *)&sockaddr_un,
+                         sizeof(struct sockaddr_un));
+
+  /* If socket_address doesn't exist on the filesystem,   */
+  /* or if the server's connection-request queue is full, */
+  /* then connect() will fail.                            */
+  if (return_value == -1) {
+    perror("unable to connect to server ipc socket");
+    exit(1);
+  }
+
+  /* close( client_socket_fd ); <-- optional */
+
+  // exit(EXIT_SUCCESS);
+}
+
+/*
+ * Structure of an Ethernet header.
+ */
+struct ether_header {
+  nd_mac48 ether_dhost;
+  nd_mac48 ether_shost;
+  nd_uint16_t ether_length_type;
+};
 pcap_handler orig_callback;
+uint8_t addr_num;
+int addresses[256];
+uint8_t bytes[256];
+#pragma pack(push, 1)
+typedef struct {
+  struct timeval ts;
+  uint8_t flow_id;
+} ipc_message;
+#pragma pack(pop)
+
+// returns -1 if not, or positive integer with offset of start of packet
+int is_ip(const uint8_t *pd, uint32_t len) {
+  int offset = sizeof(struct ether_header);
+
+  if (len < offset)
+    return -1;
+
+  struct ether_header *ehdr = (struct ether_header *)pd;
+  uint16_t eth_type = be16toh(*(uint16_t *)ehdr->ether_length_type);
+  // printf("\n\n\n");
+  // for (int i = 0; i < len; i++) {
+  //   printf("0x%02X:", pd[i]);
+  // }
+  // printf("\n\n\n");
+
+  struct ip *iphdr;
+  switch (eth_type) {
+  case ETHERTYPE_8021QinQ:
+  case ETHERTYPE_8021Q:
+    uint8_t add = eth_type == ETHERTYPE_8021QinQ ? 4 : 0;
+    if (len < offset + 4 + add)
+      return -1;
+    uint16_t eth_type = be16toh(*(uint16_t *)(pd + offset + 2 + add));
+    if (eth_type != ETHERTYPE_IP)
+      return -1;
+    return offset + 4 + add;
+  case ETHERTYPE_IP:
+    return offset;
+  default:
+    // printf("PACKET REG\n\n\n\n");
+    return -1;
+  }
+  return offset;
+}
+int is_udp(const uint8_t *pd, uint32_t len) {
+  int offset = is_ip(pd, len);
+  if (!offset)
+    return -1;
+  int ip_size = sizeof(struct ip) + offset;
+  if (len < ip_size)
+    return -1;
+
+  struct ip *iphdr = (struct ip *)pd + offset;
+  uint8_t ip_p = iphdr->ip_p[0];
+  if (ip_p != IPPROTO_UDP)
+    return -1;
+  uint8_t hlen = (iphdr->ip_vhl[0] & 0b00001111) * 4;
+  return hlen;
+}
+
 void byte_analyze(u_char *name, const struct pcap_pkthdr *phdr,
                   const u_char *pd) {
-  printf("Hello from custom callback\n");
+  int offset = is_udp(pd, phdr->len);
+  if (!offset)
+    goto exit;
+  // add udp header size
+  offset += 8;
 
+  for (int i = 0; i < addr_num; i++) {
+    // printf("%d,%c\n", addresses[i], bytes[i]);
+    int check_addr = addresses[i];
+    uint8_t expected = bytes[i];
+
+    if (offset + check_addr > phdr->len)
+      continue;
+
+    static ipc_message tmp;
+    tmp.ts = phdr->ts;
+    tmp.flow_id = *(uint8_t *)(pd + offset + check_addr);
+    if (tmp.flow_id != expected)
+      continue;
+    write(ipc_socket_fd, &tmp, sizeof(tmp));
+  }
+
+exit:
   orig_callback(name, phdr, pd);
 }
 
@@ -1348,7 +1485,7 @@ int main(int argc, char **argv) {
   bpf_u_int32 localnet = 0, netmask = 0;
   char *cp, *infile, *cmdbuf, *device, *RFileName, *VFileName, *WFileName;
   char *endp;
-  pcap_handler callback = byte_analyze;
+  pcap_handler callback;
   int dlt;
   const char *dlt_name;
   struct bpf_program fcode;
@@ -1421,9 +1558,12 @@ int main(int argc, char **argv) {
 
   while ((op = getopt_long(argc, argv, SHORTOPTS, longopts, NULL)) != -1)
     switch (op) {
+    case OPTION_IPC_NOTIFY:
+      sscanf(optarg, "%d,%c", &addresses[addr_num], &bytes[addr_num]);
+      addr_num++;
+      break;
 
     case 'a':
-      /* compatibility for old -a */
       break;
 
     case 'A':
@@ -2110,7 +2250,8 @@ int main(int argc, char **argv) {
        * that doesn't support DLT_LINUX_SLL2.
        */
       if (strcmp(device, "any") == 0) {
-        DIAG_OFF_WARN_UNUSED_RESULT(void) pcap_set_datalink(pd, DLT_LINUX_SLL2);
+        DIAG_OFF_WARN_UNUSED_RESULT(void)
+        pcap_set_datalink(pd, DLT_LINUX_SLL2);
         DIAG_ON_WARN_UNUSED_RESULT
       }
     }
@@ -2331,14 +2472,12 @@ int main(int argc, char **argv) {
 #else /* !HAVE_CAPSICUM */
       dumpinfo.WFileName = WFileName;
 #endif
-      orig_callback = dump_packet_and_trunc;
-      // callback = dump_packet_and_trunc;
+      callback = dump_packet_and_trunc;
       dumpinfo.pd = pd;
       dumpinfo.pdd = pdd;
       pcap_userdata = (u_char *)&dumpinfo;
     } else {
-      orig_callback = dump_packet;
-      // callback = dump_packet;
+      callback = dump_packet;
       dumpinfo.WFileName = WFileName;
       dumpinfo.pd = pd;
       dumpinfo.pdd = pdd;
@@ -2356,8 +2495,7 @@ int main(int argc, char **argv) {
   } else {
     dlt = pcap_datalink(pd);
     ndo->ndo_if_printer = get_if_printer(dlt);
-    orig_callback = print_packet;
-    // callback = print_packet;
+    callback = print_packet;
     pcap_userdata = (u_char *)ndo;
   }
 
@@ -2447,6 +2585,15 @@ int main(int argc, char **argv) {
   if (cansandbox && cap_enter() < 0 && errno != ENOSYS)
     error("unable to enter the capability mode");
 #endif /* HAVE_CAPSICUM */
+
+  /*
+    Start IPC communication
+  */
+  if (addr_num > 0) {
+    // socket_connect();
+    orig_callback = callback;
+    callback = byte_analyze;
+  }
 
   do {
     status = pcap_loop(pd, cnt, callback, pcap_userdata);
