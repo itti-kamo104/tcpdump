@@ -33,12 +33,11 @@
  * combined efforts of Van, Steve McCanne and Craig Leres of LBL.
  */
 
-#include <bits/types/struct_timeval.h>
 #include <config.h>
-#include <ctype.h>
 #include <endian.h>
 
 #include <ethertype.h>
+#include <pthread.h>
 #include <sys/socket.h>
 
 #include "netdissect-stdinc.h"
@@ -632,11 +631,13 @@ static void NORETURN show_remote_devices_and_exit(void) {
 #define OPTION_PRINT_SAMPLING 137
 #define OPTION_LENGTHS 138
 #define OPTION_IPC_NOTIFY 139
+#define OPTION_PIPE_OPEN 140
 
 static const struct option longopts[] = {
+    {"ipc-notify", required_argument, NULL, OPTION_IPC_NOTIFY},
+    {"pipe-open", required_argument, NULL, OPTION_PIPE_OPEN},
     {"buffer-size", required_argument, NULL, 'B'},
     {"list-interfaces", no_argument, NULL, 'D'},
-    {"ipc-notify", required_argument, NULL, OPTION_IPC_NOTIFY},
 #ifdef HAVE_PCAP_FINDALLDEVS_EX
     {"list-remote-interfaces", required_argument, NULL,
      OPTION_LIST_REMOTE_INTERFACES},
@@ -1342,59 +1343,17 @@ static pcap_t *open_interface(const char *device, netdissect_options *ndo,
 
   return (pc);
 }
-// #include <stdlib.h>
-// #include <string.h>
-// #include <stdio.h>
-// #include <unistd.h>
-// #include <assert.h>
-// #include <sys/socket.h>
-// #include <sys/types.h>
-#include <sys/un.h>
-
-char *ipc_socket_address = "/tmp/talker.sock";
-// int ipc_socket_fd;
-
-int socket_connect(int fd) {
-  struct sockaddr_un sockaddr_un = {0};
-  int return_value;
-
-  fd = socket(AF_UNIX, SOCK_STREAM, 0);
-  if (fd == -1) {
-    perror("unable to initialize client ipc socket");
-    exit(1);
-  }
-
-  /* Construct the client address structure. */
-  sockaddr_un.sun_family = AF_UNIX;
-  strcpy(sockaddr_un.sun_path, ipc_socket_address);
-
-  return_value =
-      connect(fd, (struct sockaddr *)&sockaddr_un, sizeof(struct sockaddr_un));
-
-  /* If ipc_socket_address doesn't exist on the filesystem,   */
-  /* or if the server's connection-request queue is full, */
-  /* then connect() will fail.                            */
-  if (return_value == -1) {
-    perror("unable to connect to server ipc socket");
-    exit(1);
-  }
-
-  /* close( client_socket_fd ); <-- optional */
-  printf("successfully connected to ipc socket\n");
-  return fd;
-  // exit(EXIT_SUCCESS);
-}
 
 /*
  * Structure of an Ethernet header.
  */
 #pragma pack(push, 1)
-struct ether_header {
+typedef struct {
   nd_mac48 ether_dhost;
   nd_mac48 ether_shost;
   nd_uint16_t ether_length_type;
-};
-struct ip_header {
+} ether_header;
+typedef struct {
   nd_uint8_t ip_vhl;      /* header length, version */
   nd_uint8_t ip_tos;      /* type of service */
   nd_uint16_t ip_len;     /* total length */
@@ -1404,27 +1363,109 @@ struct ip_header {
   nd_uint8_t ip_p;        /* protocol */
   nd_uint16_t ip_sum;     /* checksum */
   nd_ipv4 ip_src, ip_dst; /* source and dest address */
-};
+} ip_header;
+typedef struct {
+  uint8_t app_id;
+  uint16_t proc_id;
+  uint8_t flow_id;
+  uint64_t seq_num;
+  // reported timestamps
+  // uint8_t last_ts[10];
+  // uint8_t est_ts[10];
+  // random payload
+  uint8_t data[];
+} packet_t;
 typedef struct {
   struct timeval ts;
+  uint8_t app_id;
   uint8_t flow_id;
 } ipc_message;
 #pragma pack(pop)
 
 pcap_handler orig_callback;
-uint8_t addr_num;
-int addresses[256];
-int bytes[256];
-int pipes_fd[256];
+
+pthread_mutex_t mutex;
+pthread_cond_t cond_var;
+pthread_t send_thread;
+
+#define BUFF_SIZE 256
+typedef struct {
+  ipc_message buf[BUFF_SIZE];
+  int lpos;
+  int rpos;
+  uint8_t new_data;
+} circular_buffer;
+circular_buffer msg_buffer;
+
+void insert(circular_buffer *buff, ipc_message *msg) {
+  buff->rpos = ++buff->rpos % BUFF_SIZE;
+  memcpy(&buff->buf[buff->rpos], msg, sizeof(ipc_message));
+}
+ipc_message pop(circular_buffer *buff) {
+  int tmp = buff->lpos;
+  buff->lpos = ++buff->lpos % BUFF_SIZE;
+  return buff->buf[tmp];
+}
+ipc_message *top(circular_buffer *buff) { return &buff->buf[buff->lpos]; }
+
+struct {
+  uint8_t size;
+  int pos[256];
+  int byte[256];
+} bytes_arr;
+
+struct {
+  int fd[256];
+  uint8_t app_ids[256];
+  uint8_t size;
+} pipes_arr;
+
+int from_str(char *str) {
+  if (str[0] == '0' && str[1] == 'x') {
+    // read as a hex
+    int byte;
+    sscanf(str, "0x%x", &byte);
+    return byte;
+  } else if (('z' >= str[0] && str[0] >= 'a') ||
+             ('Z' >= str[0] && str[0] >= 'A')) {
+    // read as char
+    return str[0];
+  } else {
+    // read as an integer
+    return atoi(str);
+  }
+}
+
+void *send_routine(void *args) {
+  ipc_message buff[BUFF_SIZE];
+  while (1) {
+    pthread_mutex_lock(&mutex);
+    while (!msg_buffer.new_data)
+      pthread_cond_wait(&cond_var, &mutex);
+    msg_buffer.new_data = 0;
+
+    int i = 0;
+    while (msg_buffer.lpos != msg_buffer.rpos) {
+      buff[i++] = pop(&msg_buffer);
+    }
+    pthread_mutex_unlock(&mutex);
+
+    for (int j = 0; j < i; j++) {
+      write(pipes_arr.fd[buff[j].app_id], &buff[j], sizeof(ipc_message));
+    }
+    const char *template = i > 1 ? "%d messages sent\n" : "%d message sent\n";
+    printf(template, i);
+  }
+}
 
 // returns -1 if not, or positive integer with offset of start of packet
 int is_ip(const uint8_t *pd, uint32_t len) {
-  int offset = sizeof(struct ether_header);
+  int offset = sizeof(ether_header);
 
   if (len < offset)
     return -1;
 
-  struct ether_header *ehdr = (struct ether_header *)pd;
+  ether_header *ehdr = (ether_header *)pd;
   uint16_t eth_type = be16toh(*(uint16_t *)ehdr->ether_length_type);
 
   struct ip *iphdr;
@@ -1456,7 +1497,7 @@ int is_udp(const uint8_t *pd, uint32_t len) {
 
   struct ip *iphdr = (struct ip *)(pd + offset);
   uint8_t ip_p = iphdr->ip_p[0];
-  printf("ip proto: %02x\n", ip_p);
+  // printf("ip proto: %02x\n", ip_p);
   if (ip_p != IPPROTO_UDP)
     return -1;
   int hlen = (iphdr->ip_vhl[0] & 0b00001111) * 4;
@@ -1476,30 +1517,36 @@ void byte_analyze(u_char *name, const struct pcap_pkthdr *phdr,
   //   printf("0x%02x:", pd[offset + i]);
   // }
   // printf("\n");
+  if (phdr->len < offset + sizeof(packet_t))
+    goto exit;
 
-  for (int i = 0; i < addr_num; i++) {
-    int check_addr = addresses[i];
-    int expected = bytes[i];
-    printf("checking for number: 0x%x at position: %d\n", expected, check_addr);
+  packet_t *pkt = (packet_t *)(pd + offset);
 
-    if (offset + check_addr > phdr->len)
+  for (int i = 0; i < bytes_arr.size; i++) {
+    int check_addr = bytes_arr.pos[i];
+    int expected = bytes_arr.byte[i];
+    // printf("checking for number: 0x%x at position: %d\n", expected,
+    // check_addr);
+
+    if (offset + check_addr > phdr->len) {
+      fprintf(stderr, "read position bigger than the packet: %d", check_addr);
       continue;
+    }
 
     static ipc_message tmp;
     tmp.ts = phdr->ts;
+    tmp.app_id = pkt->app_id;
     tmp.flow_id = *(uint8_t *)(pd + offset + check_addr);
+    // tmp.flow_id = pkt->flow_id;
+
     if (tmp.flow_id != expected)
       continue;
-    // printf("found matching byte:0x%02x at position:%d\n", tmp.flow_id,
-    //        check_addr);
-    int ret = write(ipc_socket_fd, &tmp, sizeof(tmp));
-    // int ret = send(ipc_socket_fd, &tmp, sizeof(tmp), MSG_NOSIGNAL);
-    if (ret > 0) {
-      printf("success sending to ipc socket:%s\n", ipc_socket_address);
-      continue;
-    }
-    // close(ipc_socket_fd);
-    // socket_connect();
+
+    pthread_mutex_lock(&mutex);
+    insert(&msg_buffer, &tmp);
+    msg_buffer.new_data = 1;
+    pthread_mutex_unlock(&mutex);
+    pthread_cond_signal(&cond_var);
   }
 
 exit:
@@ -1583,25 +1630,28 @@ int main(int argc, char **argv) {
   tzset();
   while ((op = getopt_long(argc, argv, SHORTOPTS, longopts, NULL)) != -1)
     switch (op) {
-    case OPTION_IPC_NOTIFY:
-      char str[1024];
-      sscanf(optarg, "%d,%1023s", &addresses[addr_num], str);
-      if (str[0] == '0' && str[1] == 'x') {
-        // read as a hex
-        int byte;
-        sscanf(str, "0x%x", &byte);
-        bytes[addr_num] = byte;
-      } else if (('z' >= str[0] && str[0] >= 'a') ||
-                 ('Z' >= str[0] && str[0] >= 'A')) {
-        // read as char
-        bytes[addr_num] = str[0];
-      } else {
+    case OPTION_PIPE_OPEN: {
+      char str1[1024];
+      char str2[1024];
+      // %d?-app_id???, %s-pipe_name?
+      sscanf(optarg, "%1023[^,],%1023s", str1, str2);
+      int app_id = from_str(str1);
+      mkfifo(str2, 0666);
+      int ret = open(str2, O_WRONLY);
+      if (ret < 0)
+        break;
 
-        // read as an integer
-        bytes[addr_num] = atoi(str);
-      }
-      addr_num++;
+      pipes_arr.fd[app_id] = ret;
+      pipes_arr.app_ids[pipes_arr.size++] = app_id;
       break;
+    }
+    case OPTION_IPC_NOTIFY: {
+      char str[1024];
+      sscanf(optarg, "%d,%1023s", &bytes_arr.pos[bytes_arr.size], str);
+      bytes_arr.byte[bytes_arr.size] = from_str(str);
+      bytes_arr.size++;
+      break;
+    }
 
     case 'a':
       break;
@@ -2629,10 +2679,14 @@ int main(int argc, char **argv) {
   /*
     Start IPC communication
   */
-  if (addr_num > 0) {
-    socket_connect();
+  if (bytes_arr.size > 0) {
     orig_callback = callback;
     callback = byte_analyze;
+    // pthread_mutex_t mt;
+    // pthread_cond_t cond;
+    pthread_mutex_init(&mutex, NULL);
+    pthread_cond_init(&cond_var, NULL);
+    pthread_create(&send_thread, NULL, send_routine, NULL);
   }
 
   do {
@@ -2817,6 +2871,9 @@ static void cleanup(int signo _U_) {
    * the ANSI C standard doesn't say it is).
    */
   pcap_breakloop(pd);
+  for (int i = 0; i < pipes_arr.size; i++) {
+    close(pipes_arr.fd[pipes_arr.app_ids[i]]);
+  }
 }
 
 /*
